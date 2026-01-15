@@ -1,0 +1,22 @@
+{
+  "name": "awwwards-easing-extractor",
+  "version": "1.0.0",
+  "description": "Extract easing functions from Awwwards SOTD winning sites",
+  "main": "easing-extractor.js",
+  "scripts": {
+    "start": "node easing-extractor.js",
+    "analyze": "node easing-extractor.js"
+  },
+  "keywords": [
+    "awwwards",
+    "easing",
+    "animation",
+    "css",
+    "gsap"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer": "^24.35.0"
+  }
+}
