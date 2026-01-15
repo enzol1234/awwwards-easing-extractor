@@ -85,29 +85,55 @@ class EasingExtractor {
         });
 
         // 2. Extract GSAP easings
-        if (window.gsap) {
-          try {
-            // Check for gsap timeline or tween configurations
-            const scripts = document.querySelectorAll('script');
-            scripts.forEach(script => {
-              const content = script.textContent;
-              
-              // GSAP easing patterns
-              const gsapEaseRegex = /ease:\s*["']([^"']+)["']/g;
-              const matches = [...content.matchAll(gsapEaseRegex)];
-              matches.forEach(match => {
-                if (!results.javascript.gsap.includes(match[1])) {
-                  results.javascript.gsap.push(match[1]);
-                }
-              });
+        const scriptEls = Array.from(document.scripts || []);
+        const anyScriptSrcMatches = (re) => scriptEls.some(s => re.test(String(s.src || '')));
+        const anyInlineMatches = (re) => scriptEls.some(s => re.test(String(s.textContent || '')));
 
-              // Custom GSAP cubic-bezier
-              const customBezier = /CustomEase\.create\([^)]+\)/g;
-              const customMatches = [...content.matchAll(customBezier)];
-              customMatches.forEach(match => {
-                results.javascript.gsap.push(match[0]);
+        const gsapDetected = (() => {
+          if (typeof window.gsap !== 'undefined') return true;
+          if (
+            typeof window.TweenMax !== 'undefined' ||
+            typeof window.TweenLite !== 'undefined' ||
+            typeof window.TimelineMax !== 'undefined' ||
+            typeof window.TimelineLite !== 'undefined'
+          ) return true;
+          if (anyScriptSrcMatches(/(gsap|greensock|tweenmax|tweenlite|scrolltrigger)/i)) return true;
+          if (anyInlineMatches(/(\bgsap\b|CustomEase|ScrollTrigger|TweenMax|TweenLite)/i)) return true;
+          try {
+            const resources = performance.getEntriesByType?.('resource') || [];
+            if (resources.some(r => /(gsap|greensock|scrolltrigger|tweenmax|tweenlite)/i.test(String(r.name || '')))) {
+              return true;
+            }
+          } catch (e) {}
+          return false;
+        })();
+
+        results.libraries = { gsapDetected };
+
+        if (gsapDetected) {
+          try {
+            const gsapEasings = new Set();
+            scriptEls.forEach(script => {
+              const content = String(script.textContent || '');
+              if (!content) return;
+              if (!/(\bgsap\b|CustomEase|ScrollTrigger|TweenMax|TweenLite)/i.test(content)) return;
+
+              const patterns = [
+                /ease\s*:\s*["']([^"']+)["']/g,
+                /ease\s*:\s*([a-zA-Z_$][\w$]*(?:\.[\w$]+)*(?:\([^)]*\))?)(?=\s*[,}])/g,
+                /CustomEase\.create\([^)]*\)/g
+              ];
+
+              patterns.forEach(pattern => {
+                const matches = [...content.matchAll(pattern)];
+                matches.forEach(match => {
+                  if (match[1]) gsapEasings.add(match[1].trim());
+                  else if (match[0]) gsapEasings.add(match[0]);
+                });
               });
             });
+
+            results.javascript.gsap = Array.from(gsapEasings);
           } catch (e) {
             console.error('GSAP extraction error:', e);
           }
@@ -203,6 +229,9 @@ class EasingExtractor {
       console.log(`✅ Found ${easings.css.transitions.length} CSS transitions`);
       console.log(`✅ Found ${easings.css.animations.length} CSS animations`);
       console.log(`✅ Found ${easings.javascript.gsap.length} GSAP easings`);
+      if (easings.libraries?.gsapDetected) {
+        console.log(`   └─ GSAP detected on page (heuristic)`);
+      }
       
       return siteData;
 

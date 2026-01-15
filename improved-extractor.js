@@ -1,6 +1,43 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs').promises;
 
+const MAX_CAPTURED_SCRIPT_BYTES = 4 * 1024 * 1024; // 4MB
+const MAX_CAPTURED_SCRIPTS = 40;
+const MAX_SAMPLED_NON_HINT_SCRIPTS = 15;
+
+function textLooksLikeJavaScript(contentType, url) {
+  const ct = String(contentType || '').toLowerCase();
+  if (ct.includes('javascript') || ct.includes('ecmascript')) return true;
+  return /\.m?js(\?|#|$)/i.test(String(url || ''));
+}
+
+function hasGsapHint(textOrUrl) {
+  const haystack = String(textOrUrl || '');
+  return /(\bgsap\b|greensock|scrolltrigger|customease|tweenmax|tweenlite|timelinemax|timelinelite)/i.test(haystack);
+}
+
+function extractGsapEasingsFromText(text) {
+  const results = new Set();
+  const content = String(text || '');
+
+  const stringEase = /ease\s*:\s*["']([^"']+)["']/g;
+  for (const match of content.matchAll(stringEase)) {
+    if (match[1]) results.add(match[1].trim());
+  }
+
+  const identifierEase = /ease\s*:\s*([a-zA-Z_$][\w$]*(?:\.[\w$]+)*(?:\([^)]*\))?)(?=\s*[,}])/g;
+  for (const match of content.matchAll(identifierEase)) {
+    if (match[1]) results.add(match[1].trim());
+  }
+
+  const customEase = /CustomEase\.create\([^)]*\)/g;
+  for (const match of content.matchAll(customEase)) {
+    if (match[0]) results.add(match[0]);
+  }
+
+  return Array.from(results);
+}
+
 class ImprovedEasingExtractor {
   constructor() {
     this.results = [];
@@ -9,6 +46,13 @@ class ImprovedEasingExtractor {
   async extractEasings(url) {
     let browser = null;
     let page = null;
+    const capturedScripts = [];
+    let sampledNonHintScripts = 0;
+    let sawGsapScriptUrl = false;
+    let sawScrollTriggerScriptUrl = false;
+    let seenScriptResponses = 0;
+    let attemptedNonHintCaptures = 0;
+    const scriptUrlsSeen = [];
     
     try {
       // Launch browser with more conservative settings
@@ -53,6 +97,49 @@ class ImprovedEasingExtractor {
       
       console.log(`\n🔍 Analyzing: ${url}`);
 
+      // Capture external JS bundles so we can detect GSAP even when it isn't exposed as `window.gsap`
+      page.on('response', async (response) => {
+        try {
+          if (capturedScripts.length >= MAX_CAPTURED_SCRIPTS) return;
+          const request = response.request();
+          if (request.resourceType() !== 'script') return;
+
+          const scriptUrl = response.url();
+          seenScriptResponses++;
+          if (scriptUrlsSeen.length < 8) scriptUrlsSeen.push(scriptUrl);
+
+          if (hasGsapHint(scriptUrl)) sawGsapScriptUrl = true;
+          if (/scrolltrigger/i.test(scriptUrl)) sawScrollTriggerScriptUrl = true;
+
+          const headers = response.headers();
+          const contentType = headers['content-type'] || headers['Content-Type'];
+          if (!textLooksLikeJavaScript(contentType, scriptUrl)) return;
+
+          const urlHasHint = hasGsapHint(scriptUrl);
+          const contentLengthHeader = headers['content-length'] || headers['Content-Length'];
+          const contentLength = Number(contentLengthHeader);
+
+          if (!urlHasHint) {
+            if (sampledNonHintScripts >= MAX_SAMPLED_NON_HINT_SCRIPTS) return;
+            sampledNonHintScripts++;
+            attemptedNonHintCaptures++;
+            if (Number.isFinite(contentLength) && contentLength > MAX_CAPTURED_SCRIPT_BYTES) return;
+          } else {
+            if (Number.isFinite(contentLength) && contentLength > MAX_CAPTURED_SCRIPT_BYTES) return;
+          }
+
+          const buffer = await response.buffer();
+          if (!buffer || buffer.length > MAX_CAPTURED_SCRIPT_BYTES) return;
+
+          const text = buffer.toString('utf8');
+          if (!urlHasHint && !hasGsapHint(text)) return;
+
+          capturedScripts.push({ url: scriptUrl, text });
+        } catch {
+          // Ignore script capture failures
+        }
+      });
+
       // Inject comprehensive animation interceptor BEFORE page loads
       await page.evaluateOnNewDocument(() => {
         window.capturedAnimations = {
@@ -70,9 +157,13 @@ class ImprovedEasingExtractor {
         window.addEventListener('load', () => {
           setTimeout(() => {
             // ===== GSAP Detection and Interception =====
-            if (window.gsap) {
+            const hookGsapIfPresent = () => {
+              if (!window.gsap) return false;
+              if (window.gsap.__easingExtractorHooked) return true;
+              window.gsap.__easingExtractorHooked = true;
+
               console.log('[EXTRACTOR] GSAP detected!');
-              
+
               const captureAnimationProps = (vars) => {
                 if (!vars) return {};
                 return {
@@ -88,68 +179,51 @@ class ImprovedEasingExtractor {
                   customEase: typeof vars.ease === 'object' ? JSON.stringify(vars.ease) : null
                 };
               };
-              
-              const originalTo = window.gsap.to;
-              window.gsap.to = function(targets, vars) {
-                const props = captureAnimationProps(vars);
-                if (props.scrollTrigger) {
-                  window.capturedAnimations.gsapScrollTrigger.push({
-                    method: 'to',
+
+              const wrapMethod = (methodName) => {
+                const original = window.gsap[methodName];
+                if (typeof original !== 'function') return;
+                window.gsap[methodName] = function(...args) {
+                  const vars = methodName === 'fromTo' ? args[2] : args[1];
+                  const props = captureAnimationProps(vars);
+                  const bucket = props.scrollTrigger ? 'gsapScrollTrigger' : 'gsap';
+                  window.capturedAnimations[bucket].push({
+                    method: methodName,
                     ...props
                   });
-                } else {
-                  window.capturedAnimations.gsap.push({
-                    method: 'to',
-                    ...props
-                  });
-                }
-                return originalTo.apply(this, arguments);
-              };
-              
-              const originalFrom = window.gsap.from;
-              window.gsap.from = function(targets, vars) {
-                const props = captureAnimationProps(vars);
-                if (props.scrollTrigger) {
-                  window.capturedAnimations.gsapScrollTrigger.push({
-                    method: 'from',
-                    ...props
-                  });
-                } else {
-                  window.capturedAnimations.gsap.push({
-                    method: 'from',
-                    ...props
-                  });
-                }
-                return originalFrom.apply(this, arguments);
-              };
-              
-              const originalFromTo = window.gsap.fromTo;
-              window.gsap.fromTo = function(targets, fromVars, toVars) {
-                const props = captureAnimationProps(toVars);
-                if (props.scrollTrigger) {
-                  window.capturedAnimations.gsapScrollTrigger.push({
-                    method: 'fromTo',
-                    ...props
-                  });
-                } else {
-                  window.capturedAnimations.gsap.push({
-                    method: 'fromTo',
-                    ...props
-                  });
-                }
-                return originalFromTo.apply(this, arguments);
+                  return original.apply(this, args);
+                };
               };
 
-              // Capture ScrollTrigger details
-              if (window.gsap.registerPlugin && window.ScrollTrigger) {
+              wrapMethod('to');
+              wrapMethod('from');
+              wrapMethod('fromTo');
+
+              // Capture ScrollTrigger details (when available globally or via GSAP globals)
+              let scrollTrigger = window.ScrollTrigger;
+              try {
+                scrollTrigger = scrollTrigger || (window.gsap && window.gsap.core && window.gsap.core.globals && window.gsap.core.globals().ScrollTrigger);
+              } catch {}
+
+              if (window.gsap.registerPlugin && scrollTrigger) {
                 console.log('[EXTRACTOR] ScrollTrigger detected!');
                 window.capturedAnimations.scrollTriggerInfo = {
                   available: true,
-                  version: window.ScrollTrigger.version,
-                  triggers: window.ScrollTrigger.getAll ? window.ScrollTrigger.getAll().length : 'unknown'
+                  version: scrollTrigger.version,
+                  triggers: scrollTrigger.getAll ? scrollTrigger.getAll().length : 'unknown'
                 };
               }
-            }
+
+              return true;
+            };
+
+            // GSAP is often loaded after `load`; poll briefly to hook when it appears
+            const maxMs = 15000;
+            const start = Date.now();
+            const interval = setInterval(() => {
+              const hooked = hookGsapIfPresent();
+              if (hooked || Date.now() - start > maxMs) clearInterval(interval);
+            }, 250);
 
             // ===== Lenis Smooth Scroll Detection =====
             if (window.Lenis) {
@@ -288,6 +362,43 @@ class ImprovedEasingExtractor {
 
       // Extract all easings and animation details
       const easings = await page.evaluate(() => {
+        const scriptEls = Array.from(document.scripts || []);
+
+        const anyScriptSrcMatches = (re) => scriptEls.some(s => re.test(String(s.src || '')));
+        const anyInlineMatches = (re) => scriptEls.some(s => re.test(String(s.textContent || '')));
+
+        const gsapEvidence = [];
+        const scrollTriggerEvidence = [];
+        const animeEvidence = [];
+        const lenisEvidence = [];
+
+        if (typeof window.gsap !== 'undefined') gsapEvidence.push('global.gsap');
+        if (
+          typeof window.TweenMax !== 'undefined' ||
+          typeof window.TweenLite !== 'undefined' ||
+          typeof window.TimelineMax !== 'undefined' ||
+          typeof window.TimelineLite !== 'undefined'
+        ) gsapEvidence.push('global.legacy');
+        if (anyScriptSrcMatches(/(gsap|greensock|tweenmax|tweenlite|scrolltrigger)/i)) gsapEvidence.push('script-src');
+        if (anyInlineMatches(/(\bgsap\b|CustomEase|ScrollTrigger|TweenMax|TweenLite)/i)) gsapEvidence.push('inline-code');
+        try {
+          const resources = performance.getEntriesByType?.('resource') || [];
+          if (resources.some(r => /(gsap|greensock|scrolltrigger|tweenmax|tweenlite)/i.test(String(r.name || '')))) {
+            gsapEvidence.push('resource');
+          }
+        } catch {}
+
+        if (typeof window.ScrollTrigger !== 'undefined') scrollTriggerEvidence.push('global.ScrollTrigger');
+        if (anyScriptSrcMatches(/scrolltrigger/i)) scrollTriggerEvidence.push('script-src');
+        if (anyInlineMatches(/\bScrollTrigger\b/i)) scrollTriggerEvidence.push('inline-code');
+
+        if (typeof window.anime !== 'undefined') animeEvidence.push('global.anime');
+        if (anyScriptSrcMatches(/anime(\.min)?\.js/i)) animeEvidence.push('script-src');
+        if (anyInlineMatches(/\banime\b/i)) animeEvidence.push('inline-code');
+
+        if (typeof window.Lenis !== 'undefined') lenisEvidence.push('global.Lenis');
+        if (anyScriptSrcMatches(/\blenis\b/i)) lenisEvidence.push('script-src');
+
         const results = {
           css: {
             transitions: [],
@@ -304,11 +415,13 @@ class ImprovedEasingExtractor {
             custom: []
           },
           libraries: {
-            gsapDetected: typeof window.gsap !== 'undefined',
-            scrollTriggerDetected: typeof window.ScrollTrigger !== 'undefined',
-            lenisDetected: typeof window.Lenis !== 'undefined',
-            animeDetected: typeof window.anime !== 'undefined',
-            gsapVersion: window.gsap ? (window.gsap.version || 'unknown') : null,
+            gsapDetected: gsapEvidence.length > 0,
+            scrollTriggerDetected: scrollTriggerEvidence.length > 0,
+            lenisDetected: lenisEvidence.length > 0,
+            animeDetected: animeEvidence.length > 0,
+            gsapEvidence,
+            scrollTriggerEvidence,
+            gsapVersion: window.gsap ? (window.gsap.version || 'unknown') : (window.TweenMax ? (window.TweenMax.version || 'unknown') : null),
             scrollTriggerInfo: window.capturedAnimations.scrollTriggerInfo || null,
             lenisInfo: window.capturedAnimations.lenisInfo || null,
             locomotiveScroll: typeof window.LocomotiveScroll !== 'undefined'
@@ -428,32 +541,30 @@ class ImprovedEasingExtractor {
           });
         } catch (e) {}
 
-        if (results.libraries.gsapDetected) {
-          const scripts = document.querySelectorAll('script');
+        // Extract GSAP-like easings from inline scripts (external bundles are handled in Node via response capture)
+        try {
           const gsapEasings = new Set();
-          
-          scripts.forEach(script => {
-            const content = script.textContent;
-            
+          scriptEls.forEach(script => {
+            const content = String(script.textContent || '');
+            if (!content) return;
+            if (!/(\bgsap\b|CustomEase|ScrollTrigger|TweenMax|TweenLite)/i.test(content)) return;
+
             const patterns = [
               /ease\s*:\s*["']([^"']+)["']/g,
-              /ease\s*:\s*([a-zA-Z0-9.()]+)(?=\s*[,}])/g,
-              /\.to\([^)]*ease\s*:\s*["']([^"']+)["']/g,
-              /\.from\([^)]*ease\s*:\s*["']([^"']+)["']/g,
+              /ease\s*:\s*([a-zA-Z_$][\w$]*(?:\.[\w$]+)*(?:\([^)]*\))?)(?=\s*[,}])/g,
+              /CustomEase\.create\([^)]*\)/g
             ];
 
             patterns.forEach(pattern => {
               const matches = [...content.matchAll(pattern)];
               matches.forEach(match => {
-                if (match[1]) {
-                  gsapEasings.add(match[1].trim());
-                }
+                if (match[1]) gsapEasings.add(match[1].trim());
+                else if (match[0]) gsapEasings.add(match[0]);
               });
             });
           });
-
           results.javascript.gsap = Array.from(gsapEasings);
-        }
+        } catch {}
 
         if (results.libraries.animeDetected) {
           const scripts = document.querySelectorAll('script');
@@ -519,6 +630,50 @@ class ImprovedEasingExtractor {
         extractedAt: new Date().toISOString()
       };
 
+      // Merge in GSAP evidence/easings extracted from external JS bundles (via network responses)
+      try {
+        const gsapEasings = new Set(siteData.easings.javascript.gsap || []);
+        const gsapEvidence = new Set(siteData.easings.libraries.gsapEvidence || []);
+        let sawGsapInNetwork = false;
+
+        if (sawGsapScriptUrl) {
+          sawGsapInNetwork = true;
+          gsapEvidence.add('network-js-url');
+        }
+        if (sawScrollTriggerScriptUrl) {
+          siteData.easings.libraries.scrollTriggerDetected = true;
+          siteData.easings.libraries.scrollTriggerEvidence = Array.from(new Set([
+            ...(siteData.easings.libraries.scrollTriggerEvidence || []),
+            'network-js-url'
+          ]));
+        }
+
+        for (const script of capturedScripts) {
+          if (hasGsapHint(script.text) || hasGsapHint(script.url)) {
+            sawGsapInNetwork = true;
+            gsapEvidence.add('network-js');
+          }
+
+          if (/scrolltrigger/i.test(script.text)) {
+            siteData.easings.libraries.scrollTriggerDetected = true;
+            siteData.easings.libraries.scrollTriggerEvidence = Array.from(new Set([
+              ...(siteData.easings.libraries.scrollTriggerEvidence || []),
+              'network-js'
+            ]));
+          }
+
+          for (const easing of extractGsapEasingsFromText(script.text)) {
+            gsapEasings.add(easing);
+          }
+        }
+
+        if (sawGsapInNetwork) siteData.easings.libraries.gsapDetected = true;
+        siteData.easings.libraries.gsapEvidence = Array.from(gsapEvidence);
+        siteData.easings.javascript.gsap = Array.from(gsapEasings);
+      } catch {
+        // Ignore merge failures
+      }
+
       this.results.push(siteData);
       
       console.log('\n📊 Animation Libraries Detected:');
@@ -526,9 +681,21 @@ class ImprovedEasingExtractor {
       if (easings.libraries.gsapVersion) {
         console.log(`   └─ Version: ${easings.libraries.gsapVersion}`);
       }
+      if (Array.isArray(easings.libraries.gsapEvidence) && easings.libraries.gsapEvidence.length > 0) {
+        console.log(`   └─ Evidence: ${easings.libraries.gsapEvidence.join(', ')}`);
+      } else {
+        console.log(`   └─ Evidence: (none)`);
+      }
+      console.log(`   └─ Network scripts: seen=${seenScriptResponses}, captured=${capturedScripts.length}, nonhint-attempts=${attemptedNonHintCaptures}`);
+      if (!easings.libraries.gsapDetected && capturedScripts.length === 0 && scriptUrlsSeen.length > 0) {
+        console.log(`   └─ Sample script URLs: ${scriptUrlsSeen.slice(0, 3).join(' | ')}`);
+      }
       console.log(`   ScrollTrigger: ${easings.libraries.scrollTriggerDetected ? '✅ DETECTED' : '❌ Not found'}`);
       if (easings.libraries.scrollTriggerInfo) {
         console.log(`   └─ Active Triggers: ${easings.libraries.scrollTriggerInfo.triggers}`);
+      }
+      if (Array.isArray(easings.libraries.scrollTriggerEvidence) && easings.libraries.scrollTriggerEvidence.length > 0) {
+        console.log(`   └─ Evidence: ${easings.libraries.scrollTriggerEvidence.join(', ')}`);
       }
       console.log(`   Lenis (Smooth Scroll): ${easings.libraries.lenisDetected ? '✅ DETECTED' : '❌ Not found'}`);
       if (easings.libraries.lenisInfo) {
